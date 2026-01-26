@@ -16,8 +16,8 @@ from pathlib import Path
 # -------------------
 # Config
 # -------------------
-CUDA_SOURCE = "transpose1.cu"
-CUDA_BINARY = "transpose1_bin"
+CUDA_SOURCE = "transpose_modified.cu"  # Relative to script directory
+CUDA_BINARY = "transpose_bin"
 LOG_DIR = Path("power_logs_transpose")
 CSV_FILE = Path("transpose_dataset.csv")
 
@@ -25,17 +25,16 @@ CSV_FILE = Path("transpose_dataset.csv")
 TILE_DIMS = [16, 32, 64]
 WORK_PER_THREAD = [1, 2, 4]
 THREAD_BLOCK_DIMS = [8, 16, 32]  # Will give 64, 256, 1024 threads per block
-STRIDE_ACCESS = [1, 2]
 SHARED = [0, 1]
 UNROLL = [0, 1]
 GRID_SCALES = [1.0, 1.5, 2.0]
 REGISTER_LIMITS = [32, 64, 128]
 
-POWER_LOG_DURATION = 60     # seconds
+POWER_LOG_DURATION = 10     # seconds (reduced for Colab - was 60)
 NVIDIA_SMI_INTERVAL = 1     # seconds (sampling interval)
 
 # Ensure dirs
-SCRIPT_DIR = Path(__file__).parent.resolve()
+SCRIPT_DIR = Path.cwd()
 CUDA_SRC_PATH = SCRIPT_DIR / CUDA_SOURCE
 CUDA_BIN_PATH = SCRIPT_DIR / CUDA_BINARY
 LOG_DIR.mkdir(exist_ok=True)
@@ -64,15 +63,15 @@ SPEEDUP_RE = re.compile(r"Speedup \(optimized vs naive\):\s*([0-9]*\.?[0-9]+)x")
 THREADS_RE = re.compile(r"THREAD_BLOCK_DIM:\s*(\d+)x(\d+)\s*=\s*(\d+)\s*threads/block")
 CUDA_ERR_RE = re.compile(r"(CUDA|ERROR).*?error[:\s]+(.*?)(?:\n|$)", re.IGNORECASE)
 
-def compile_cuda(tile_dim, work, thread_dim, stride, shared, unroll, grid, reg):
-    print(f"[Compiling] TILE={tile_dim}, WORK={work}, THREAD_DIM={thread_dim}, STRIDE={stride}, SHARED={shared}, UNROLL={unroll}, GRID={grid}, REG={reg}")
+def compile_cuda(tile_dim, work, thread_dim, shared, unroll, grid, reg):
+    print(f"[Compiling] TILE={tile_dim}, WORK={work}, THREAD_DIM={thread_dim}, SHARED={shared}, UNROLL={unroll}, GRID={grid}, REG={reg}")
     cmd = [
         "nvcc", "-O3",
+        "-arch=sm_89",  # NVIDIA RTX 5000 Ada Generation (compute capability 8.9)
         f"--maxrregcount={reg}",
         f"-DTILE_DIM={tile_dim}",
         f"-DWORK_PER_THREAD={work}",
         f"-DTHREAD_BLOCK_DIM={thread_dim}",
-        f"-DSTRIDE_ACCESS={stride}",
         f"-DUSE_SHARED={shared}",
         f"-DUSE_UNROLL={unroll}",
         f"-DGRID_SCALE={grid}f",
@@ -125,6 +124,37 @@ def parse_power_log(log_path):
         return None, 0
     return sum(vals)/len(vals), len(vals)
 
+def validate_config(tile, work, thread_dim, shared, unroll, grid, reg):
+    """
+    Validate configuration against hardware and algorithm constraints.
+    Returns (is_valid, skip_reason)
+    """
+    threads_pb = thread_dim * thread_dim
+    
+    # 1. Threads per block limit (hardware)
+    if threads_pb > 1024:
+        return False, "SKIP_THREADS_LIMIT"
+    
+    # 2. Must cover entire tile (CRITICAL - will produce wrong results)
+    if thread_dim * work < tile:
+        return False, f"SKIP_INCOMPLETE_TILE_COVERAGE_{thread_dim}x{work}<{tile}"
+    
+    # 3. Shared memory limit (48KB typical)
+    if shared == 1:
+        shared_mem_bytes = tile * (tile + 1) * 4  # +1 for bank conflict padding
+        if shared_mem_bytes > 49152:  # 48KB
+            return False, f"SKIP_SHARED_MEM_LIMIT_{shared_mem_bytes}B>48KB"
+    
+    # 4. Excessive work per thread (diminishing returns, register pressure)
+    if work > 8:
+        return False, f"SKIP_EXCESSIVE_WORK_PER_THREAD_{work}>8"
+    
+    # 5. Non-power-of-2 tile dimensions (poor memory alignment)
+    if tile not in [8, 16, 32, 64, 128]:
+        return False, f"SKIP_NON_POWER_OF_2_TILE_{tile}"
+    
+    return True, None
+
 def parse_output(stdout):
     """Parse the output and extract metrics for all three kernels"""
     results = {
@@ -132,14 +162,14 @@ def parse_output(stdout):
         "naive": {},
         "optimized": {}
     }
-    
+
     # Parse Copy kernel (Test 1)
     m = COPY_TIME_RE.search(stdout)
     if m: results["copy"]["time_ms"] = float(m.group(1))
     m = COPY_BW_RE.search(stdout)
     if m: results["copy"]["bandwidth_gbps"] = float(m.group(1))
     results["copy"]["correctness"] = "N/A"  # Copy doesn't have correctness check
-    
+
     # Parse Naive transpose (Test 2)
     m = NAIVE_TIME_RE.search(stdout)
     if m: results["naive"]["time_ms"] = float(m.group(1))
@@ -148,7 +178,7 @@ def parse_output(stdout):
     m = NAIVE_CORRECT_RE.search(stdout)
     if m: results["naive"]["correctness"] = m.group(1)
     else: results["naive"]["correctness"] = "UNKNOWN"
-    
+
     # Parse Optimized transpose (Test 3)
     m = OPT_TIME_RE.search(stdout)
     if m: results["optimized"]["time_ms"] = float(m.group(1))
@@ -157,20 +187,20 @@ def parse_output(stdout):
     m = OPT_CORRECT_RE.search(stdout)
     if m: results["optimized"]["correctness"] = m.group(1)
     else: results["optimized"]["correctness"] = "UNKNOWN"
-    
+
     # Parse speedup
     m = SPEEDUP_RE.search(stdout)
     speedup = float(m.group(1)) if m else None
-    
+
     # Parse threads per block
     m = THREADS_RE.search(stdout)
     threads_per_block = int(m.group(3)) if m else None
-    
+
     return results, speedup, threads_per_block
 
-def run_and_profile(tile_dim, work, thread_dim, stride, shared, unroll, grid, reg):
+def run_and_profile(tile_dim, work, thread_dim, shared, unroll, grid, reg):
     # start power logging
-    log_name = f"power_t{tile_dim}_w{work}_td{thread_dim}_str{stride}_s{shared}_u{unroll}_g{grid}_r{reg}.log"
+    log_name = f"power_t{tile_dim}_w{work}_td{thread_dim}_s{shared}_u{unroll}_g{grid}_r{reg}.log"
     log_path = LOG_DIR / log_name
     proc, handle = start_power_log(log_path)
     time.sleep(0.5)  # stabilize logging
@@ -197,7 +227,7 @@ def run_and_profile(tile_dim, work, thread_dim, stride, shared, unroll, grid, re
 
     # parse outputs for all kernels
     kernel_results, speedup, threads_pb = parse_output(stdout)
-    
+
     # Check for CUDA errors
     cuda_err = None
     m = CUDA_ERR_RE.search(stdout)
@@ -216,8 +246,8 @@ def run_and_profile(tile_dim, work, thread_dim, stride, shared, unroll, grid, re
     }
 
 def main():
-    combos = list(product(TILE_DIMS, WORK_PER_THREAD, THREAD_BLOCK_DIMS, 
-                         STRIDE_ACCESS, SHARED, UNROLL, GRID_SCALES, REGISTER_LIMITS))
+    combos = list(product(TILE_DIMS, WORK_PER_THREAD, THREAD_BLOCK_DIMS,
+                         SHARED, UNROLL, GRID_SCALES, REGISTER_LIMITS))
     total = len(combos)
     print(f"Total configurations: {total}")
     print(f"Total rows (3 kernels per config): {total * 3}")
@@ -228,7 +258,6 @@ def main():
         "work_per_thread",
         "thread_block_dim",
         "threads_per_block",
-        "stride_access",
         "use_shared",
         "use_unroll",
         "grid_scale",
@@ -251,11 +280,35 @@ def main():
         if first:
             writer.writeheader()
 
-        for idx, (tile, work, thread_dim, stride, shared, unroll, grid, reg) in enumerate(combos, start=1):
+        for idx, (tile, work, thread_dim, shared, unroll, grid, reg) in enumerate(combos, start=1):
             print(f"\n=== Run {idx}/{total} ===")
             threads_pb = thread_dim * thread_dim
-            
-            # safety check
+
+            # Validate configuration
+            is_valid, skip_reason = validate_config(tile, work, thread_dim, shared, unroll, grid, reg)
+            if not is_valid:
+                print(f"Skipping config: {skip_reason}")
+                # Write skip rows for all three kernels
+                for kernel_name in ["copy", "naive", "optimized"]:
+                    row = {k: "" for k in header}
+                    row.update({
+                        "kernel_name": kernel_name,
+                        "tile_dim": tile,
+                        "work_per_thread": work,
+                        "thread_block_dim": thread_dim,
+                        "threads_per_block": threads_pb,
+                        "use_shared": shared,
+                        "use_unroll": unroll,
+                        "grid_scale": grid,
+                        "register_limit": reg,
+                        "correctness": skip_reason
+                    })
+                    writer.writerow(row)
+                csvf.flush()
+                continue
+
+            # Old threads limit check is now redundant (covered by validate_config)
+            # but keeping for backwards compatibility
             if threads_pb > 1024:
                 print(f"Skipping config: threads_per_block={threads_pb} > 1024")
                 # Write skip rows for all three kernels
@@ -267,7 +320,6 @@ def main():
                         "work_per_thread": work,
                         "thread_block_dim": thread_dim,
                         "threads_per_block": threads_pb,
-                        "stride_access": stride,
                         "use_shared": shared,
                         "use_unroll": unroll,
                         "grid_scale": grid,
@@ -278,7 +330,7 @@ def main():
                 csvf.flush()
                 continue
 
-            ok, comp_out = compile_cuda(tile, work, thread_dim, stride, shared, unroll, grid, reg)
+            ok, comp_out = compile_cuda(tile, work, thread_dim, shared, unroll, grid, reg)
             if not ok:
                 print("Compilation failed; writing COMPILE_FAIL rows.")
                 # Write fail rows for all three kernels
@@ -290,7 +342,6 @@ def main():
                         "work_per_thread": work,
                         "thread_block_dim": thread_dim,
                         "threads_per_block": threads_pb,
-                        "stride_access": stride,
                         "use_shared": shared,
                         "use_unroll": unroll,
                         "grid_scale": grid,
@@ -302,8 +353,8 @@ def main():
                 csvf.flush()
                 continue
 
-            res = run_and_profile(tile, work, thread_dim, stride, shared, unroll, grid, reg)
-            
+            res = run_and_profile(tile, work, thread_dim, shared, unroll, grid, reg)
+
             if res["exit_code"] != 0:
                 print(f"Binary failed exit_code={res['exit_code']} cuda_err={res['cuda_error_str']}")
             else:
@@ -318,14 +369,13 @@ def main():
             # Write one row per kernel
             for kernel_name in ["copy", "naive", "optimized"]:
                 kr = res["kernel_results"].get(kernel_name, {})
-                
+
                 row = {
                     "kernel_name": kernel_name,
                     "tile_dim": tile,
                     "work_per_thread": work,
                     "thread_block_dim": thread_dim,
                     "threads_per_block": res["threads_per_block"],
-                    "stride_access": stride,
                     "use_shared": shared,
                     "use_unroll": unroll,
                     "grid_scale": grid,
@@ -342,7 +392,7 @@ def main():
                     "power_log_path": res["power_log_path"]
                 }
                 writer.writerow(row)
-            
+
             csvf.flush()
             time.sleep(0.5)
 
